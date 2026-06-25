@@ -1,0 +1,234 @@
+//@version=5
+// VWAP Deviation Scalping Indicator (VWAP-SCALP)
+// 5-min equities/crypto scalping composite: HTF EMA trend gate, VWAP deviation-band
+// mean-reversion or VWAP-break trend-continuation trigger, RVOL (+ optional CVD)
+// confirmation, cooldown debounce, ATR stop/target.
+// Per the evidence review this implements, liquidity sweeps/SMC and naive
+// unfiltered momentum are intentionally excluded as standalone triggers — a naive
+// 5-min momentum rule lost money (Sharpe -0.94, AAPL) without a trend/volume filter.
+indicator("VWAP Deviation Scalping Indicator", shorttitle="VWAP-SCALP", overlay=true)
+
+// ──────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────
+htfTimeframe = input.timeframe("60", "Higher Timeframe (Trend Gate)", group="Trend Filter")
+emaFastLen   = input.int(50,  "HTF EMA Fast Length", minval=1, group="Trend Filter")
+emaSlowLen   = input.int(200, "HTF EMA Slow Length", minval=1, group="Trend Filter")
+showHtfEmas  = input.bool(true, "Plot HTF EMAs on Chart", group="Trend Filter")
+
+devLen            = input.int(100, "VWAP Deviation Lookback (bars)", minval=10, group="VWAP")
+reversionBandMult = input.float(2.0, "Reversion Trigger Band (x StdDev)", minval=0.5, step=0.25, group="VWAP")
+reversionLookback = input.int(10, "Tag Lookback (bars)", minval=1, group="VWAP")
+showBands         = input.bool(true, "Show VWAP Deviation Bands", group="VWAP")
+
+marketType         = input.string("Equities", "Market Type", options=["Equities", "Crypto"], group="Market Type")
+cryptoBandWidenPct = input.float(12.5, "Crypto Band Widen %", minval=0.0, step=0.5, group="Market Type")
+useSessionFilter   = input.bool(true, "Avoid First/Last N Min of Session (Equities)", group="Market Type")
+firstMinSession    = input.session("0930-0945", "Equities Session Open Exclusion", group="Market Type")
+lastMinSession     = input.session("1545-1600", "Equities Session Close Exclusion", group="Market Type")
+
+triggerMode = input.string("Mean Reversion", "Trigger Mode", options=["Mean Reversion", "Trend Continuation", "Both"], group="Trigger")
+
+rvolLen       = input.int(20, "RVOL Average Length", minval=1, group="Volume")
+rvolThreshold = input.float(1.2, "RVOL Threshold", minval=0.1, step=0.1, group="Volume")
+useCvdFilter  = input.bool(false, "Require CVD Agreement (approx.)", group="Volume")
+cvdLookback   = input.int(5, "CVD Trend Lookback (bars)", minval=1, group="Volume")
+
+cooldownBars = input.int(6, "Cooldown Between Signals (bars)", minval=0, group="Cooldown")
+
+atrLen          = input.int(10, "ATR Length", minval=1, group="Stops & Targets")
+atrStopMult     = input.float(1.5, "ATR Stop Multiplier", minval=0.1, step=0.1, group="Stops & Targets")
+rMultipleTarget = input.float(1.5, "Target R-Multiple", minval=0.1, step=0.1, group="Stops & Targets")
+
+showBiasTint = input.bool(true, "Show Regime Bias Background Tint", group="Display")
+showSignals  = input.bool(true, "Show Entry / Stop-Hit Markers", group="Display")
+showSLTP     = input.bool(true, "Show Stop/Target Lines", group="Display")
+
+// ──────────────────────────────────────────────────────────────────────────
+// TREND GATE (HIGHER-TIMEFRAME EMA REGIME)
+// ──────────────────────────────────────────────────────────────────────────
+// [1] offset inside the expression + lookahead_off references only the last
+// *closed* HTF bar, so the bias never repaints on the chart timeframe.
+[htfEmaFast, htfEmaSlow, htfClose] = request.security(syminfo.tickerid, htfTimeframe,
+     [ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1], close[1]],
+     lookahead=barmerge.lookahead_off)
+
+longBias  = htfEmaFast > htfEmaSlow and htfClose > htfEmaSlow
+shortBias = htfEmaFast < htfEmaSlow and htfClose < htfEmaSlow
+
+// ──────────────────────────────────────────────────────────────────────────
+// VWAP + DEVIATION BANDS
+// ──────────────────────────────────────────────────────────────────────────
+vwapVal = ta.vwap(hlc3)
+dev     = ta.stdev(hlc3 - vwapVal, devLen)
+
+// Crypto's structurally higher intrabar volatility gets wider bands; equities
+// keep the raw stdev (per the evidence review's market-type asymmetry note).
+bandWidenMult = marketType == "Crypto" ? 1.0 + cryptoBandWidenPct / 100.0 : 1.0
+effDev        = dev * bandWidenMult
+
+upper1 = vwapVal + 1.0 * effDev
+upper2 = vwapVal + 2.0 * effDev
+upper3 = vwapVal + 3.0 * effDev
+lower1 = vwapVal - 1.0 * effDev
+lower2 = vwapVal - 2.0 * effDev
+lower3 = vwapVal - 3.0 * effDev
+
+reversionUpperBand = vwapVal + reversionBandMult * effDev
+reversionLowerBand = vwapVal - reversionBandMult * effDev
+
+// ──────────────────────────────────────────────────────────────────────────
+// SESSION FILTER (equities-only first/last-minutes exclusion — crypto trades
+// 24/7 with no open/close discontinuity, so this never applies there)
+// ──────────────────────────────────────────────────────────────────────────
+inExcludedWindow = marketType == "Equities" and useSessionFilter and (not na(time(timeframe.period, firstMinSession)) or not na(time(timeframe.period, lastMinSession)))
+sessionOk = not inExcludedWindow
+
+// ──────────────────────────────────────────────────────────────────────────
+// VOLUME: RVOL + APPROXIMATE CVD
+// ──────────────────────────────────────────────────────────────────────────
+avgVol        = ta.sma(volume, rvolLen)
+rvol          = avgVol > 0 ? volume / avgVol : 0.0
+rvolConfirmed = rvol >= rvolThreshold
+
+// Intrabar buy/sell-pressure proxy (Pine has no tick-level data): a bar that
+// closes near its high is weighted as net buying, near its low as net selling.
+barDelta   = high > low ? volume * (2.0 * (close - low) / (high - low) - 1.0) : 0.0
+newSession = ta.change(time("D")) != 0
+var float cvd = 0.0
+cvd := newSession ? barDelta : cvd + barDelta
+
+cvdRising  = cvd > cvd[cvdLookback]
+cvdFalling = cvd < cvd[cvdLookback]
+cvdLongOk  = not useCvdFilter or cvdRising
+cvdShortOk = not useCvdFilter or cvdFalling
+
+// ──────────────────────────────────────────────────────────────────────────
+// TRIGGERS
+// ──────────────────────────────────────────────────────────────────────────
+taggedLower         = ta.barssince(low <= reversionLowerBand)
+taggedUpper         = ta.barssince(high >= reversionUpperBand)
+taggedLowerRecently = not na(taggedLower) and taggedLower <= reversionLookback
+taggedUpperRecently = not na(taggedUpper) and taggedUpper <= reversionLookback
+
+reversionTriggerLong  = taggedLowerRecently and ta.crossover(close, reversionLowerBand)  and longBias
+reversionTriggerShort = taggedUpperRecently and ta.crossunder(close, reversionUpperBand) and shortBias
+
+continuationTriggerLong  = ta.crossover(close, vwapVal)  and rvolConfirmed and longBias
+continuationTriggerShort = ta.crossunder(close, vwapVal) and rvolConfirmed and shortBias
+
+triggerLong = switch triggerMode
+    "Mean Reversion"     => reversionTriggerLong
+    "Trend Continuation" => continuationTriggerLong
+    => reversionTriggerLong or continuationTriggerLong
+
+triggerShort = switch triggerMode
+    "Mean Reversion"     => reversionTriggerShort
+    "Trend Continuation" => continuationTriggerShort
+    => reversionTriggerShort or continuationTriggerShort
+
+// ──────────────────────────────────────────────────────────────────────────
+// COMBINED SIGNAL LOGIC + COOLDOWN
+// ──────────────────────────────────────────────────────────────────────────
+confirmLong  = rvolConfirmed and cvdLongOk  and close > open
+confirmShort = rvolConfirmed and cvdShortOk and close < open
+
+rawLongSignal  = barstate.isconfirmed and sessionOk and longBias  and triggerLong  and confirmLong
+rawShortSignal = barstate.isconfirmed and sessionOk and shortBias and triggerShort and confirmShort
+
+// Debounce: choppy 5-min conditions can otherwise re-fire the same stretch
+// repeatedly; this is the one new gate scalping needs that the Daily/4H
+// swing script didn't (its signals were naturally spaced by the slower TF).
+barsSinceLong   = ta.barssince(rawLongSignal[1])
+barsSinceShort  = ta.barssince(rawShortSignal[1])
+longCooldownOk  = na(barsSinceLong)  or barsSinceLong  > cooldownBars
+shortCooldownOk = na(barsSinceShort) or barsSinceShort > cooldownBars
+
+longSignal  = rawLongSignal  and longCooldownOk
+shortSignal = rawShortSignal and shortCooldownOk
+
+// ──────────────────────────────────────────────────────────────────────────
+// STOPS & TARGETS (ATR-based; shorter length than the Daily/4H swing script)
+// ──────────────────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+
+finalLongStop  = close - atrStopMult * atrVal
+finalShortStop = close + atrStopMult * atrVal
+
+longTarget  = close + rMultipleTarget * (close - finalLongStop)
+shortTarget = close - rMultipleTarget * (finalShortStop - close)
+
+// ──────────────────────────────────────────────────────────────────────────
+// POSITION STATE (visual-only — tracks which signal is active so SL/TP
+// lines and the stop-hit marker know when to extend vs. reset)
+// ──────────────────────────────────────────────────────────────────────────
+var string posState    = "flat"
+var float  activeStop   = na
+var float  activeTarget = na
+
+stopHitLong    = posState == "long"  and close < activeStop
+stopHitShort   = posState == "short" and close > activeStop
+targetHitLong  = posState == "long"  and close > activeTarget
+targetHitShort = posState == "short" and close < activeTarget
+stopHitSignal  = barstate.isconfirmed and (stopHitLong or stopHitShort)
+stopHitPrice   = stopHitSignal ? activeStop : na
+
+if barstate.isconfirmed
+    if longSignal
+        posState    := "long"
+        activeStop   := finalLongStop
+        activeTarget := longTarget
+    else if shortSignal
+        posState    := "short"
+        activeStop   := finalShortStop
+        activeTarget := shortTarget
+    else if stopHitLong or targetHitLong or stopHitShort or targetHitShort
+        posState := "flat"
+
+// ──────────────────────────────────────────────────────────────────────────
+// PLOTTING
+// ──────────────────────────────────────────────────────────────────────────
+plot(vwapVal, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
+
+plot(showBands ? upper1 : na, "Upper 1x", color=color.new(color.red, 70))
+plot(showBands ? upper2 : na, "Upper 2x", color=color.new(color.red, 50))
+plot(showBands ? upper3 : na, "Upper 3x", color=color.new(color.red, 30))
+plot(showBands ? lower1 : na, "Lower 1x", color=color.new(color.green, 70))
+plot(showBands ? lower2 : na, "Lower 2x", color=color.new(color.green, 50))
+plot(showBands ? lower3 : na, "Lower 3x", color=color.new(color.green, 30))
+
+plot(showHtfEmas ? htfEmaFast : na, "HTF EMA Fast", color=color.new(color.blue, 0))
+plot(showHtfEmas ? htfEmaSlow : na, "HTF EMA Slow", color=color.new(color.orange, 0))
+
+bgcolor(showBiasTint ? (longBias ? color.new(color.green, 90) : shortBias ? color.new(color.maroon, 90) : na) : na)
+
+var line slLine = na
+var line tpLine = na
+
+if barstate.isconfirmed and showSLTP
+    if longSignal or shortSignal
+        line.delete(slLine)
+        line.delete(tpLine)
+        slLine := line.new(bar_index, activeStop, bar_index + 10, activeStop, color=color.red, width=1)
+        tpLine := line.new(bar_index, activeTarget, bar_index + 10, activeTarget, color=color.green, width=1)
+    else if posState != "flat" and not na(slLine)
+        line.set_xy2(slLine, bar_index + 3, line.get_y1(slLine))
+        line.set_xy2(tpLine, bar_index + 3, line.get_y1(tpLine))
+    else if posState == "flat" and not na(slLine)
+        line.delete(slLine)
+        line.delete(tpLine)
+        slLine := na
+        tpLine := na
+
+plotshape(showSignals and longSignal,  title="Long Entry",  style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.small)
+plotshape(showSignals and shortSignal, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.red, size=size.small)
+plotshape(showSignals ? stopHitPrice : na, title="Stop Hit", style=shape.xcross,
+     location=location.absolute, color=color.gray, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────
+alertcondition(longSignal,  title="VWAP-SCALP Long Entry",  message="Long scalp: HTF trend + VWAP trigger + volume aligned on {{ticker}} {{interval}}")
+alertcondition(shortSignal, title="VWAP-SCALP Short Entry", message="Short scalp: HTF trend + VWAP trigger + volume aligned on {{ticker}} {{interval}}")
