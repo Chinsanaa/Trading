@@ -1,0 +1,342 @@
+//@version=5
+// Trend-Filtered Structure & Volume Swing Indicator (TF-SVS)
+// Daily/4H swing-trading composite: EMA regime gate, BOS structure break or
+// FVG/Order-Block pullback trigger, RVOL confirmation, ATR/Chandelier stop.
+// FVG/OB are entry-location and stop-placement aids only, never standalone
+// signals, per the evidence review this script implements.
+indicator("Trend-Filtered Structure & Volume Swing Indicator", shorttitle="TF-SVS",
+     overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ──────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────
+emaFastLen    = input.int(50,  "EMA Fast Length", minval=1, group="Trend Filter")
+emaSlowLen    = input.int(200, "EMA Slow Length", minval=1, group="Trend Filter")
+useHtfConfirm = input.bool(true, "Confirm with Daily EMA regime (intraday charts)", group="Trend Filter")
+
+pivotLen      = input.int(10, "Swing Pivot Lookback (bars each side)", minval=2, group="Swing Structure")
+showStructure = input.bool(false, "Show BOS Labels", group="Swing Structure")
+
+fvgAtrMult           = input.float(0.25, "FVG Min Size (x ATR)", minval=0.0, step=0.05, group="FVG / Order Blocks")
+displacementAtrMult  = input.float(1.5, "Displacement Threshold (x ATR)", minval=0.1, step=0.1, group="FVG / Order Blocks")
+maxZonesTracked      = input.int(20, "Max Zones Tracked per Type", minval=1, maxval=100, group="FVG / Order Blocks")
+showFVG              = input.bool(true, "Show FVG Boxes", group="FVG / Order Blocks")
+showOB               = input.bool(true, "Show Order Block Boxes", group="FVG / Order Blocks")
+
+rvolLen       = input.int(20, "RVOL Average Length", minval=1, group="Volume")
+rvolThreshold = input.float(1.5, "RVOL Threshold", minval=0.1, step=0.1, group="Volume")
+
+atrLen          = input.int(14, "ATR Length", minval=1, group="Stops & Targets")
+atrStopMult     = input.float(2.5, "ATR Stop Multiplier", minval=0.1, step=0.1, group="Stops & Targets")
+chandelierLen   = input.int(22, "Chandelier Length", minval=1, group="Stops & Targets")
+chandelierMult  = input.float(3.0, "Chandelier Multiplier", minval=0.1, step=0.1, group="Stops & Targets")
+rMultipleTarget = input.float(2.5, "Target R-Multiple", minval=0.1, step=0.1, group="Stops & Targets")
+stopMode        = input.string("ATR", "Stop Mode", options=["ATR", "Chandelier", "Tighter of ATR/Zone"], group="Stops & Targets")
+
+showBiasTint = input.bool(true, "Show Regime Bias Background Tint", group="Display")
+showSignals  = input.bool(true, "Show Entry / Stop-Hit Markers", group="Display")
+showSLTP     = input.bool(true, "Show Stop/Target Lines", group="Display")
+
+// ──────────────────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────
+// Backward iteration (size-1 down to 0) is required so array.remove() never
+// skips an element or runs past a shrinking array.
+f_gcZones(boxArr, isBullish) =>
+    i = array.size(boxArr) - 1
+    while i >= 0
+        bx = array.get(boxArr, i)
+        mitigated = isBullish ? close < box.get_bottom(bx) : close > box.get_top(bx)
+        if mitigated
+            box.delete(bx)
+            array.remove(boxArr, i)
+        else
+            box.set_right(bx, bar_index)
+        i -= 1
+
+f_capZones(boxArr, maxCount) =>
+    while array.size(boxArr) > maxCount
+        bx = array.shift(boxArr)
+        box.delete(bx)
+
+f_priceInsideAnyZone(boxArr) =>
+    found = false
+    n = array.size(boxArr)
+    if n > 0
+        for i = 0 to n - 1
+            bx = array.get(boxArr, i)
+            if close <= box.get_top(bx) and close >= box.get_bottom(bx)
+                found := true
+    found
+
+f_nearestBoundaryBelow(boxArr) =>
+    nearest = float(na)
+    n = array.size(boxArr)
+    if n > 0
+        for i = 0 to n - 1
+            bx = array.get(boxArr, i)
+            b = box.get_bottom(bx)
+            if b < close and (na(nearest) or b > nearest)
+                nearest := b
+    nearest
+
+f_nearestBoundaryAbove(boxArr) =>
+    nearest = float(na)
+    n = array.size(boxArr)
+    if n > 0
+        for i = 0 to n - 1
+            bx = array.get(boxArr, i)
+            t = box.get_top(bx)
+            if t > close and (na(nearest) or t < nearest)
+                nearest := t
+    nearest
+
+// ──────────────────────────────────────────────────────────────────────────
+// REGIME GATE (TREND FILTER)
+// ──────────────────────────────────────────────────────────────────────────
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+longBiasChart  = close > emaSlow and emaFast > emaSlow
+shortBiasChart = close < emaSlow and emaFast < emaSlow
+
+htfAvailable = timeframe.isintraday
+// [1] offset inside the expression + lookahead_off references the last
+// *closed* Daily bar only, so the bias never repaints on the lower timeframe.
+[dEmaFast, dEmaSlow, dClose] = request.security(syminfo.tickerid, "D",
+     [ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1], close[1]],
+     lookahead=barmerge.lookahead_off)
+
+longBias  = useHtfConfirm and htfAvailable ? (longBiasChart  and dClose > dEmaSlow and dEmaFast > dEmaSlow) : longBiasChart
+shortBias = useHtfConfirm and htfAvailable ? (shortBiasChart and dClose < dEmaSlow and dEmaFast < dEmaSlow) : shortBiasChart
+
+// ──────────────────────────────────────────────────────────────────────────
+// SWING STRUCTURE / BOS-CHoCH (close-confirmed, no wick fakeouts)
+// ──────────────────────────────────────────────────────────────────────────
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   structureTrend = 0
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+bosUp   = barstate.isconfirmed and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bosDown = barstate.isconfirmed and not na(lastSwingLow)  and close < lastSwingLow  and close[1] >= lastSwingLow
+
+choch = false
+if bosUp
+    choch := structureTrend == -1
+    structureTrend := 1
+if bosDown
+    choch := structureTrend == 1
+    structureTrend := -1
+
+if barstate.isconfirmed and showStructure and bosUp
+    label.new(bar_index, lastSwingHigh, choch ? "CHoCH+" : "BOS+", style=label.style_label_down,
+         color=color.new(color.green, 0), textcolor=color.white, size=size.tiny)
+if barstate.isconfirmed and showStructure and bosDown
+    label.new(bar_index, lastSwingLow, choch ? "CHoCH-" : "BOS-", style=label.style_label_up,
+         color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────
+// FVG / ORDER BLOCK DETECTION + ZONE MANAGEMENT
+// ──────────────────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+
+var box[] activeBullishFVGs = array.new<box>()
+var box[] activeBearishFVGs = array.new<box>()
+var box[] activeBullishOBs  = array.new<box>()
+var box[] activeBearishOBs  = array.new<box>()
+
+bullishFVG = low > high[2] and (low - high[2]) > fvgAtrMult * atrVal
+bearishFVG = high < low[2] and (low[2] - high) > fvgAtrMult * atrVal
+
+// Box visuals are toggled via transparency rather than skipping creation,
+// so hiding FVGs never changes the zones the signal logic trades against.
+if barstate.isconfirmed and bullishFVG
+    bx = box.new(bar_index[2], low, bar_index, high[2],
+         border_color=color.new(color.lime, showFVG ? 60 : 100),
+         bgcolor=color.new(color.lime, showFVG ? 85 : 100))
+    array.push(activeBullishFVGs, bx)
+
+if barstate.isconfirmed and bearishFVG
+    bx = box.new(bar_index[2], low[2], bar_index, high,
+         border_color=color.new(color.red, showFVG ? 60 : 100),
+         bgcolor=color.new(color.red, showFVG ? 85 : 100))
+    array.push(activeBearishFVGs, bx)
+
+displacement = math.abs(close - open) > displacementAtrMult * atrVal
+
+if barstate.isconfirmed and displacement and close > open and bosUp and close[1] < open[1]
+    obBx = box.new(bar_index[1], high[1], bar_index, low[1],
+         border_color=color.new(color.blue, showOB ? 50 : 100),
+         bgcolor=color.new(color.blue, showOB ? 85 : 100))
+    array.push(activeBullishOBs, obBx)
+
+if barstate.isconfirmed and displacement and close < open and bosDown and close[1] > open[1]
+    obBx = box.new(bar_index[1], high[1], bar_index, low[1],
+         border_color=color.new(color.maroon, showOB ? 50 : 100),
+         bgcolor=color.new(color.maroon, showOB ? 85 : 100))
+    array.push(activeBearishOBs, obBx)
+
+f_gcZones(activeBullishFVGs, true)
+f_gcZones(activeBearishFVGs, false)
+f_gcZones(activeBullishOBs, true)
+f_gcZones(activeBearishOBs, false)
+
+f_capZones(activeBullishFVGs, maxZonesTracked)
+f_capZones(activeBearishFVGs, maxZonesTracked)
+f_capZones(activeBullishOBs, maxZonesTracked)
+f_capZones(activeBearishOBs, maxZonesTracked)
+
+// ──────────────────────────────────────────────────────────────────────────
+// VOLUME / RVOL
+// ──────────────────────────────────────────────────────────────────────────
+avgVol        = ta.sma(volume, rvolLen)
+rvol          = avgVol > 0 ? volume / avgVol : 0.0
+rvolConfirmed = rvol >= rvolThreshold
+
+// ──────────────────────────────────────────────────────────────────────────
+// COMBINED SIGNAL LOGIC
+// ──────────────────────────────────────────────────────────────────────────
+// lastSwingHigh/lastSwingLow may come from non-adjacent pivots; this is an
+// approximation of "the current swing range," not a strictly matched pair.
+swingRangeValid = not na(lastSwingHigh) and not na(lastSwingLow) and lastSwingHigh > lastSwingLow
+midpoint        = swingRangeValid ? lastSwingLow + (lastSwingHigh - lastSwingLow) * 0.5 : na
+inDiscountZone  = swingRangeValid and close < midpoint
+inPremiumZone   = swingRangeValid and close > midpoint
+
+priceInBullishZone = f_priceInsideAnyZone(activeBullishFVGs) or f_priceInsideAnyZone(activeBullishOBs)
+priceInBearishZone = f_priceInsideAnyZone(activeBearishFVGs) or f_priceInsideAnyZone(activeBearishOBs)
+
+triggerStructureLong  = bosUp   and longBias
+triggerStructureShort = bosDown and shortBias
+triggerZoneLong       = priceInBullishZone and inDiscountZone and longBias
+triggerZoneShort      = priceInBearishZone and inPremiumZone  and shortBias
+
+triggerLong  = triggerStructureLong  or triggerZoneLong
+triggerShort = triggerStructureShort or triggerZoneShort
+
+confirmLong  = rvolConfirmed and close > open
+confirmShort = rvolConfirmed and close < open
+
+// barstate.isconfirmed is redundant with bosUp/bosDown (already bar-close
+// gated) but is the only gate on the zone-pullback path, which is otherwise
+// evaluated continuously intrabar.
+longSignal  = barstate.isconfirmed and longBias  and triggerLong  and confirmLong
+shortSignal = barstate.isconfirmed and shortBias and triggerShort and confirmShort
+
+// ──────────────────────────────────────────────────────────────────────────
+// STOPS & TARGETS
+// ──────────────────────────────────────────────────────────────────────────
+atrStopLong  = close - atrStopMult * atrVal
+atrStopShort = close + atrStopMult * atrVal
+
+var float chandLongStop  = na
+var float chandShortStop = na
+
+atrChand        = ta.atr(chandelierLen)
+chandLongBasic  = ta.highest(high, chandelierLen) - chandelierMult * atrChand
+chandShortBasic = ta.lowest(low, chandelierLen)   + chandelierMult * atrChand
+
+// Ratchet: the stop can only tighten in the position's favor; comparisons
+// against na (bar 0) default to false in Pine, so this is safe unguarded.
+chandLongStop  := close[1] > chandLongStop[1]  ? math.max(chandLongBasic, chandLongStop[1])  : chandLongBasic
+chandShortStop := close[1] < chandShortStop[1] ? math.min(chandShortBasic, chandShortStop[1]) : chandShortBasic
+
+nearestLongZone  = f_nearestBoundaryBelow(activeBullishFVGs)
+nearestLongZone2 = f_nearestBoundaryBelow(activeBullishOBs)
+nearestLongZoneBoundary = na(nearestLongZone) ? nearestLongZone2 : na(nearestLongZone2) ? nearestLongZone : math.max(nearestLongZone, nearestLongZone2)
+
+nearestShortZone  = f_nearestBoundaryAbove(activeBearishFVGs)
+nearestShortZone2 = f_nearestBoundaryAbove(activeBearishOBs)
+nearestShortZoneBoundary = na(nearestShortZone) ? nearestShortZone2 : na(nearestShortZone2) ? nearestShortZone : math.min(nearestShortZone, nearestShortZone2)
+
+tighterLongStop  = na(nearestLongZoneBoundary)  ? atrStopLong  : math.max(atrStopLong, nearestLongZoneBoundary)
+tighterShortStop = na(nearestShortZoneBoundary) ? atrStopShort : math.min(atrStopShort, nearestShortZoneBoundary)
+
+finalLongStop = switch stopMode
+    "ATR"        => atrStopLong
+    "Chandelier" => chandLongStop
+    => tighterLongStop
+
+finalShortStop = switch stopMode
+    "ATR"        => atrStopShort
+    "Chandelier" => chandShortStop
+    => tighterShortStop
+
+longRisk    = close - finalLongStop
+shortRisk   = finalShortStop - close
+longTarget  = close + rMultipleTarget * longRisk
+shortTarget = close - rMultipleTarget * shortRisk
+
+// ──────────────────────────────────────────────────────────────────────────
+// POSITION STATE (visual-only — tracks which signal is active so SL/TP
+// lines and the stop-hit marker know when to extend vs. reset)
+// ──────────────────────────────────────────────────────────────────────────
+var string posState    = "flat"
+var float  activeStop   = na
+var float  activeTarget = na
+
+stopHitLong    = posState == "long"  and close < activeStop
+stopHitShort   = posState == "short" and close > activeStop
+targetHitLong  = posState == "long"  and close > activeTarget
+targetHitShort = posState == "short" and close < activeTarget
+stopHitSignal  = barstate.isconfirmed and (stopHitLong or stopHitShort)
+stopHitPrice   = stopHitSignal ? activeStop : na
+
+if barstate.isconfirmed
+    if longSignal
+        posState    := "long"
+        activeStop   := finalLongStop
+        activeTarget := longTarget
+    else if shortSignal
+        posState    := "short"
+        activeStop   := finalShortStop
+        activeTarget := shortTarget
+    else if stopHitLong or targetHitLong or stopHitShort or targetHitShort
+        posState := "flat"
+
+// ──────────────────────────────────────────────────────────────────────────
+// PLOTTING
+// ──────────────────────────────────────────────────────────────────────────
+plot(emaFast, "EMA Fast", color=color.new(color.blue, 0))
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0))
+
+bgcolor(showBiasTint ? (longBias ? color.new(color.green, 90) : shortBias ? color.new(color.maroon, 90) : na) : na)
+
+var line slLine = na
+var line tpLine = na
+
+if barstate.isconfirmed and showSLTP
+    if longSignal or shortSignal
+        line.delete(slLine)
+        line.delete(tpLine)
+        slLine := line.new(bar_index, activeStop, bar_index + 20, activeStop, color=color.red, width=1)
+        tpLine := line.new(bar_index, activeTarget, bar_index + 20, activeTarget, color=color.green, width=1)
+    else if posState != "flat" and not na(slLine)
+        line.set_xy2(slLine, bar_index + 5, line.get_y1(slLine))
+        line.set_xy2(tpLine, bar_index + 5, line.get_y1(tpLine))
+    else if posState == "flat" and not na(slLine)
+        line.delete(slLine)
+        line.delete(tpLine)
+        slLine := na
+        tpLine := na
+
+plotshape(showSignals and longSignal,  title="Long Entry",  style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.small)
+plotshape(showSignals and shortSignal, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.red, size=size.small)
+plotshape(showSignals ? stopHitPrice : na, title="Stop Hit", style=shape.xcross,
+     location=location.absolute, color=color.gray, size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────
+alertcondition(longSignal,  title="TF-SVS Long Entry",  message="Long signal: trend + structure/zone + volume aligned on {{ticker}} {{interval}}")
+alertcondition(shortSignal, title="TF-SVS Short Entry", message="Short signal: trend + structure/zone + volume aligned on {{ticker}} {{interval}}")
