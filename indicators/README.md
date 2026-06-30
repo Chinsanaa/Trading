@@ -55,6 +55,7 @@ Two `alertcondition()`s are exposed (`VWAP-SCALP Long Entry`, `VWAP-SCALP Short 
 
 ### Limitations
 
+- The trend-gate bias and every signal use only the last **closed** HTF bar, so they intentionally lag the live market by up to one full HTF bar (this is what keeps the script non-repainting). The optional HTF EMA plot lines (`Plot HTF EMAs on Chart`), by contrast, show **live**, intrabar-updating values for visual reference. Near an HTF bar boundary the lines and the background bias tint can therefore visibly diverge for a bar or two — that's expected, not a bug, and mirrors the same lag tradeoff the swing script accepts with its Daily confirmation.
 - CVD here is an **intrabar approximation**, not true tick-level cumulative volume delta — treat the optional CVD filter as a secondary nudge, not a precise order-flow read.
 - Funding rate / open interest data is intentionally excluded — not reliably available via Pine's `request.security` for most exchanges, and it's a different strategy category (funding arbitrage, not directional scalping) anyway.
 - No backtest equity/drawdown stats are produced by an `indicator()`. As with the swing script, a `strategy()` port sharing the same gating logic would be a natural follow-up if quantitative validation is needed — the evidence review's strongest caution (naive 5-min momentum producing Sharpe -0.94) makes backtesting this composite before any live automation especially important.

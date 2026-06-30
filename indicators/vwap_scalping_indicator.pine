@@ -47,14 +47,21 @@ showSLTP     = input.bool(true, "Show Stop/Target Lines", group="Display")
 // ──────────────────────────────────────────────────────────────────────────
 // TREND GATE (HIGHER-TIMEFRAME EMA REGIME)
 // ──────────────────────────────────────────────────────────────────────────
-// [1] offset inside the expression + lookahead_off references only the last
-// *closed* HTF bar, so the bias never repaints on the chart timeframe.
-[htfEmaFast, htfEmaSlow, htfClose] = request.security(syminfo.tickerid, htfTimeframe,
-     [ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1], close[1]],
+// One request.security call returns both a "confirmed" and a "live" reading.
+// Confirmed values keep the [1] offset + lookahead_off, so they reference only
+// the last *closed* HTF bar — these drive longBias/shortBias and every signal,
+// and never repaint. Live values have no offset: they track the still-forming
+// HTF bar intrabar and are for the on-chart EMA lines only (showHtfEmas below),
+// so the chart visually matches what a trader watching the live HTF EMAs sees.
+// Near an HTF bar boundary the live lines and the confirmed bias can disagree
+// for up to one HTF bar — that's the intentional non-repainting lag, not a bug.
+[confirmedEmaFast, confirmedEmaSlow, confirmedClose, liveEmaFast, liveEmaSlow] = request.security(syminfo.tickerid, htfTimeframe,
+     [ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1], close[1],
+      ta.ema(close, emaFastLen),    ta.ema(close, emaSlowLen)],
      lookahead=barmerge.lookahead_off)
 
-longBias  = htfEmaFast > htfEmaSlow and htfClose > htfEmaSlow
-shortBias = htfEmaFast < htfEmaSlow and htfClose < htfEmaSlow
+longBias  = confirmedEmaFast > confirmedEmaSlow and confirmedClose > confirmedEmaSlow
+shortBias = confirmedEmaFast < confirmedEmaSlow and confirmedClose < confirmedEmaSlow
 
 // ──────────────────────────────────────────────────────────────────────────
 // VWAP + DEVIATION BANDS
@@ -197,8 +204,8 @@ plot(showBands ? lower1 : na, "Lower 1x", color=color.new(color.green, 70))
 plot(showBands ? lower2 : na, "Lower 2x", color=color.new(color.green, 50))
 plot(showBands ? lower3 : na, "Lower 3x", color=color.new(color.green, 30))
 
-plot(showHtfEmas ? htfEmaFast : na, "HTF EMA Fast", color=color.new(color.blue, 0))
-plot(showHtfEmas ? htfEmaSlow : na, "HTF EMA Slow", color=color.new(color.orange, 0))
+plot(showHtfEmas ? liveEmaFast : na, "HTF EMA Fast (Live)", color=color.new(color.blue, 0))
+plot(showHtfEmas ? liveEmaSlow : na, "HTF EMA Slow (Live)", color=color.new(color.orange, 0))
 
 bgcolor(showBiasTint ? (longBias ? color.new(color.green, 90) : shortBias ? color.new(color.maroon, 90) : na) : na)
 
